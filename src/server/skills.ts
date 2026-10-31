@@ -74,7 +74,8 @@ export function parseExternalSkillDirsFromConfig(content: string): string[] {
     if (!inSkillsSection) continue;
 
     if (inExternalDirsList) {
-      if (indent > externalDirsIndent && trimmed.startsWith("-")) {
+      const isSeqItem = trimmed === "-" || trimmed.startsWith("- ");
+      if (indent >= externalDirsIndent && isSeqItem) {
         const item = stripYamlScalar(trimmed.slice(1));
         if (item) dirs.push(item);
         continue;

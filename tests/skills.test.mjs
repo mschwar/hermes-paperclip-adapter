@@ -36,6 +36,18 @@ test("parseExternalSkillDirsFromConfig supports inline and block YAML lists", ()
     "~/.hermes/shared-skills/skills",
     "~/extra-skills",
   ]);
+
+  const indentlessBlock = [
+    "skills:",
+    "  external_dirs:",
+    "  - ~/.hermes/shared-skills/skills",
+    "  - /opt/fleet/skills",
+    "  create_dir: ~/.hermes/shared-skills/skills",
+  ].join("\n");
+  assert.deepEqual(parseExternalSkillDirsFromConfig(indentlessBlock), [
+    "~/.hermes/shared-skills/skills",
+    "/opt/fleet/skills",
+  ]);
 });
 
 test("expandTildePath expands ~ against configured home", () => {
