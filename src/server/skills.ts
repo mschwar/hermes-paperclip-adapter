@@ -31,6 +31,148 @@ function resolveHermesHome(config: Record<string, unknown>): string {
   return configuredHome ? path.resolve(configuredHome) : os.homedir();
 }
 
+export function expandTildePath(rawPath: string, home: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed === "~") return home;
+  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return path.join(home, trimmed.slice(2));
+  }
+  return path.isAbsolute(trimmed) ? path.normalize(trimmed) : path.resolve(home, trimmed);
+}
+
+function stripYamlScalar(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  if (
+    (trimmed.startsWith('"') && trimmed.indexOf('"', 1) > 0) ||
+    (trimmed.startsWith("'") && trimmed.indexOf("'", 1) > 0)
+  ) {
+    const quote = trimmed[0];
+    const end = trimmed.indexOf(quote, 1);
+    return trimmed.slice(1, end).trim();
+  }
+  const commentIdx = trimmed.indexOf(" #");
+  return (commentIdx >= 0 ? trimmed.slice(0, commentIdx) : trimmed).trim();
+}
+
+export function parseExternalSkillDirsFromConfig(content: string): string[] {
+  const dirs: string[] = [];
+  let inSkillsSection = false;
+  let inExternalDirsList = false;
+  let externalDirsIndent = 0;
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = rawLine.length - rawLine.trimStart().length;
+
+    if (indent === 0) {
+      inSkillsSection = /^skills:\s*(?:#.*)?$/.test(trimmed);
+      inExternalDirsList = false;
+      continue;
+    }
+    if (!inSkillsSection) continue;
+
+    if (inExternalDirsList) {
+      if (indent > externalDirsIndent && trimmed.startsWith("-")) {
+        const item = stripYamlScalar(trimmed.slice(1));
+        if (item) dirs.push(item);
+        continue;
+      }
+      if (indent <= externalDirsIndent) {
+        inExternalDirsList = false;
+      }
+    }
+
+    const kvMatch = trimmed.match(/^([A-Za-z0-9_-]+)\s*:(.*)$/);
+    if (!kvMatch) continue;
+    const key = kvMatch[1];
+    const rest = kvMatch[2].trim();
+    if (key !== "external_dirs") continue;
+
+    if (!rest || rest.startsWith("#")) {
+      inExternalDirsList = true;
+      externalDirsIndent = indent;
+      continue;
+    }
+
+    const withoutComment =
+      rest.startsWith("[") && rest.includes("]")
+        ? rest.slice(0, rest.lastIndexOf("]") + 1)
+        : stripYamlScalar(rest);
+    if (withoutComment.startsWith("[") && withoutComment.endsWith("]")) {
+      const inner = withoutComment.slice(1, -1);
+      for (const part of inner.split(",")) {
+        const item = stripYamlScalar(part);
+        if (item) dirs.push(item);
+      }
+    } else if (withoutComment) {
+      dirs.push(withoutComment);
+    }
+  }
+
+  return dirs;
+}
+
+function formatLocationPrefix(dir: string, home: string): string {
+  const rel = path.relative(home, dir);
+  if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+    return `~/${rel.split(path.sep).join("/")}`;
+  }
+  return dir;
+}
+
+async function resolveHermesSkillRoots(
+  config: Record<string, unknown>,
+  home: string,
+): Promise<Array<{ dir: string; locationPrefix: string }>> {
+  const env =
+    typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
+      ? (config.env as Record<string, unknown>)
+      : {};
+  const configuredHermesHome = asString(env.HERMES_HOME);
+  const hermesDir = configuredHermesHome
+    ? expandTildePath(configuredHermesHome, home)
+    : path.join(home, ".hermes");
+
+  const rawDirs: string[] = [path.join(hermesDir, "skills")];
+
+  // 1. Read skills.external_dirs from <hermesDir>/config.yaml if present
+  try {
+    const yamlText = await fs.readFile(path.join(hermesDir, "config.yaml"), "utf8");
+    rawDirs.push(...parseExternalSkillDirsFromConfig(yamlText));
+  } catch {
+    // config.yaml missing or unreadable — fall back to defaults
+  }
+
+  // 2. Also honor config.skills.external_dirs if provided in adapterConfig
+  if (typeof config.skills === "object" && config.skills !== null && !Array.isArray(config.skills)) {
+    const ext = (config.skills as Record<string, unknown>).external_dirs;
+    if (typeof ext === "string" && ext.trim()) {
+      rawDirs.push(ext.trim());
+    } else if (Array.isArray(ext)) {
+      for (const item of ext) {
+        if (typeof item === "string" && item.trim()) {
+          rawDirs.push(item.trim());
+        }
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  const roots: Array<{ dir: string; locationPrefix: string }> = [];
+  for (const raw of rawDirs) {
+    const resolved = expandTildePath(raw, home);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    roots.push({
+      dir: resolved,
+      locationPrefix: formatLocationPrefix(resolved, home),
+    });
+  }
+  return roots;
+}
+
 interface SkillFrontmatter {
   name?: string;
   description?: string;
@@ -59,6 +201,7 @@ function parseSkillFrontmatter(content: string): SkillFrontmatter {
 
 async function scanHermesSkills(
   skillsHome: string,
+  locationPrefix = "~/.hermes/skills",
 ): Promise<AdapterSkillEntry[]> {
   const entries: AdapterSkillEntry[] = [];
 
@@ -71,7 +214,7 @@ async function scanHermesSkills(
       // Check if the category directory itself has a SKILL.md (top-level skill)
       const topLevelSkillMd = path.join(catPath, "SKILL.md");
       if (await fs.stat(topLevelSkillMd).catch(() => null)) {
-        entries.push(await buildSkillEntry(cat.name, topLevelSkillMd, cat.name));
+        entries.push(await buildSkillEntry(cat.name, topLevelSkillMd, cat.name, locationPrefix));
       }
 
       // Scan for sub-skills
@@ -81,12 +224,14 @@ async function scanHermesSkills(
         const skillMd = path.join(catPath, item.name, "SKILL.md");
         if (await fs.stat(skillMd).catch(() => null)) {
           const key = item.name;
-          entries.push(await buildSkillEntry(key, skillMd, `${cat.name}/${item.name}`));
+          entries.push(
+            await buildSkillEntry(key, skillMd, `${cat.name}/${item.name}`, locationPrefix),
+          );
         }
       }
     }
   } catch {
-    // ~/.hermes/skills/ doesn't exist — no skills available
+    // Skill directory doesn't exist — skip
   }
 
   return entries.sort((a, b) => a.key.localeCompare(b.key));
@@ -96,6 +241,7 @@ async function buildSkillEntry(
   key: string,
   skillMdPath: string,
   categoryPath: string,
+  locationPrefix = "~/.hermes/skills",
 ): Promise<AdapterSkillEntry> {
   let description: string | null = null;
   try {
@@ -114,7 +260,7 @@ async function buildSkillEntry(
     state: "installed",
     origin: "user_installed",
     originLabel: "Hermes skill",
-    locationLabel: `~/.hermes/skills/${categoryPath}`,
+    locationLabel: `${locationPrefix}/${categoryPath}`,
     readOnly: true, // Hermes manages its own skills — Paperclip can't toggle them
     sourcePath: skillMdPath,
     targetPath: null,
@@ -128,7 +274,7 @@ async function buildSkillEntry(
 
 async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promise<AdapterSkillSnapshot> {
   const home = resolveHermesHome(config);
-  const hermesSkillsHome = path.join(home, ".hermes", "skills");
+  const skillRoots = await resolveHermesSkillRoots(config, home);
 
   // 1. Scan Paperclip-managed skills (bundled with the adapter)
   const paperclipEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
@@ -136,8 +282,19 @@ async function buildHermesSkillSnapshot(config: Record<string, unknown>): Promis
   const desiredSet = new Set(desiredSkills);
   const availableByKey = new Map(paperclipEntries.map((e) => [e.key, e]));
 
-  // 2. Scan Hermes's own skills from ~/.hermes/skills/
-  const hermesSkillEntries = await scanHermesSkills(hermesSkillsHome);
+  // 2. Scan Hermes's own skills from ~/.hermes/skills/ and expanded skills.external_dirs
+  const hermesByKey = new Map<string, AdapterSkillEntry>();
+  for (const root of skillRoots) {
+    const scanned = await scanHermesSkills(root.dir, root.locationPrefix);
+    for (const entry of scanned) {
+      if (!hermesByKey.has(entry.key)) {
+        hermesByKey.set(entry.key, entry);
+      }
+    }
+  }
+  const hermesSkillEntries = Array.from(hermesByKey.values()).sort((a, b) =>
+    a.key.localeCompare(b.key),
+  );
   const hermesKeys = new Set(hermesSkillEntries.map((e) => e.key));
 
   // 3. Merge: Paperclip skills first (ephemeral), then Hermes skills
